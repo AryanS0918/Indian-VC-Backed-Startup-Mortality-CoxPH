@@ -1,0 +1,260 @@
+---
+title: "Startup Survival Analysis CoxPH"
+output: html_notebook
+---
+
+ 
+
+```{r}
+#SETUP & IMPORT
+
+# Install readxl if you haven't already: install.packages("readxl")
+library(readxl)
+library(tidyverse)
+library(survival)
+library(survminer)
+library(car) 
+
+# Import the Excel file
+# Make sure your working directory is set to where this file is saved
+df_raw <- read_excel("/Users/aryans/Downloads/Compiled Research Data FINAL (I hope).xlsx", sheet = "Master Dataset")
+
+# View the first few rows to ensure it loaded correctly
+head(df_raw)
+```
+```{r}
+#DATA PREP & DESCRIPTIVE STATS
+library(readxl)
+library(tidyverse)
+library(survival)
+library(survminer)
+
+# Load Data
+df <- read_excel("/Users/aryans/Downloads/Compiled Research Data FINAL (I hope).xlsx", sheet = "Master Dataset")
+
+# Clean & Calculate Duration
+df <- df %>%
+  mutate(
+    Closure_Year = as.numeric(str_sub(Closure_Quarter_Year, -4)),
+    Duration = Closure_Year - Founding_Year
+  ) %>%
+  filter(Duration > 0)
+
+df$Sector <- as.factor(df$Sector)
+
+# Clean the Closure_Quarter_Year text string into a numeric decimal
+df$Closure_Year_Num <- as.numeric(sub("Q._", "", df$Closure_Quarter_Year))
+df$Quarter_Num <- as.numeric(sub("_.*", "", sub("Q", "", df$Closure_Quarter_Year)))
+
+# Convert Q1 to .25, Q2 to .50, Q3 to .75, Q4 to 1.00
+df$Closure_Decimal <- df$Closure_Year_Num + (df$Quarter_Num * 0.25)
+
+# Calculate the Duration variable (Dependent Variable)
+df$Duration <- df$Closure_Decimal - df$Founding_Year
+
+# Run the Cox Model (Replicating your screenshot exactly)
+library(survival)
+model_baseline <- coxph(Surv(Duration, Event_Status) ~ GDP_Growth_YoY + CPI_Inflation + RBI_Repo_Rate + factor(Sector), data = df)
+summary(model_baseline)
+
+# Generate Descriptive Statistics
+print("SUMMARY OF SURVIVAL DURATIONS")
+summary(df$Duration)
+
+print("EVENT STATUS BREAKDOWN (0 = Alive, 1 = Dead)")
+table(df$Event_Status)
+
+print("SECTOR BREAKDOWN")
+table(df$Sector)
+
+```
+
+```{r}
+# UNIVARIATE COX MODELS
+
+# GDP Only
+uni_gdp <- coxph(Surv(Duration, Event_Status) ~ GDP_Growth_YoY, data = df)
+print("UNIVARIATE: GDP")
+summary(uni_gdp)
+
+# CPI Only
+uni_cpi <- coxph(Surv(Duration, Event_Status) ~ CPI_Inflation, data = df)
+print("UNIVARIATE: CPI")
+summary(uni_cpi)
+
+```
+
+```{r}
+#BASELINE MULTIVARIATE MODEL
+model_baseline <- coxph(Surv(Duration, Event_Status) ~ GDP_Growth_YoY + CPI_Inflation + RBI_Repo_Rate, 
+                        data = df, robust = TRUE)
+
+print("BASELINE MODEL (MACROS ONLY)")
+summary(model_baseline)
+```
+
+```{r}
+# FULL MODEL (MACROS + SECTORS)
+model_full <- coxph(Surv(Duration, Event_Status) ~ GDP_Growth_YoY + CPI_Inflation + RBI_Repo_Rate + Sector, 
+                    data = df, robust = TRUE)
+
+print("--- FULL MODEL RESULTS ---")
+summary(model_full)
+```
+
+```{r}
+# LIKELIHOOD RATIO TEST (FIXED)
+# We fit temporary non-robust models purely for the ANOVA test
+
+# Temporary Baseline Model (No robust=TRUE)
+model_baseline_lrt <- coxph(Surv(Duration, Event_Status) ~ GDP_Growth_YoY + CPI_Inflation + RBI_Repo_Rate, 
+                            data = df)
+
+# Temporary Full Model (No robust=TRUE)
+model_full_lrt <- coxph(Surv(Duration, Event_Status) ~ GDP_Growth_YoY + CPI_Inflation + RBI_Repo_Rate + Sector, 
+                        data = df)
+
+# The Likelihood Ratio Test
+print("DOES SECTOR MATTER? (ANOVA TEST)")
+anova(model_baseline_lrt, model_full_lrt)
+```
+```{r}
+# THE FINAL PARSIMONIOUS MODEL
+# Since sectors were insignificant, our final model relies only on the macro variables.
+# We will use this model's coefficients for the final write-up.
+model_final <- coxph(Surv(Duration, Event_Status) ~ GDP_Growth_YoY + CPI_Inflation + RBI_Repo_Rate, 
+                     data = df)
+
+print("FINAL MODEL RESULTS")
+summary(model_final)
+
+# Model Predictive Power (Concordance Index)
+# A value between 0.5 (random guess) and 1.0 (perfect prediction)
+print(paste("Concordance Index (C-index):", summary(model_final)$concordance[1]))
+```
+```{r}
+#THE FUNDING WINTER STRUCTURAL BREAK
+
+#Create the Funding Winter Dummy (2022 onwards)
+df <- df %>%
+  mutate(Funding_Winter = ifelse(Closure_Year >= 2022, 1, 0))
+
+# Convert to a factor so R treats it as a dummy variable
+df$Funding_Winter <- as.factor(df$Funding_Winter)
+
+# Run the Structural Break Model (Interaction Term)
+# The asterisk (*) tells R to test the Repo Rate, the Winter Dummy, AND their interaction.
+model_break <- coxph(Surv(Duration, Event_Status) ~ GDP_Growth_YoY + CPI_Inflation + 
+                       RBI_Repo_Rate * Funding_Winter, 
+                     data = df, robust = TRUE)
+
+print("FUNDING WINTER STRUCTURAL BREAK RESULTS")
+summary(model_break)
+```
+
+```{r}
+# DIAGNOSTIC ASSUMPTIONS
+library(car)
+
+#Multicollinearity (VIF)
+dummy_lm <- lm(Duration ~ GDP_Growth_YoY + CPI_Inflation + RBI_Repo_Rate, data = df)
+print("VIF TEST (Must be < 5)")
+print(vif(dummy_lm))
+
+#Proportional Hazards Assumption
+ph_test <- cox.zph(model_final)
+print("SCHOENFELD RESIDUALS (Global p must be > 0.05)")
+print(ph_test)
+
+# Plotting the residuals for the final model
+plot(ph_test)
+```
+
+```{r}
+
+
+library(gridExtra) # To arrange the plots together
+
+# Extract the Martingale residuals from the NULL Cox model
+# We use a null model (~ 1) because we are testing the functional form of the covariates against the baseline hazard
+res_martingale <- residuals(coxph(Surv(Duration, Event_Status) ~ 1, data = df), type = "martingale")
+
+# Add the residuals back to your main dataframe
+df$Mart_Res <- res_martingale
+
+# Set your smoothing span (Higher = Smoother. Default is usually 0.75. Try 1.0 or 1.2)
+smooth_span <- 1.2 
+
+# Build individual smoothed plots for each macroeconomic variable
+plot_gdp <- ggplot(df, aes(x = GDP_Growth_YoY, y = Mart_Res)) +
+  geom_point(alpha = 0.4, color = "black") +
+  geom_smooth(method = "loess", span = smooth_span, color = "blue", se = TRUE) +
+  theme_minimal() +
+  labs(title = "GDP Growth", x = "Real GDP Growth (YoY)", y = "Martingale Residual")
+
+plot_cpi <- ggplot(df, aes(x = CPI_Inflation, y = Mart_Res)) +
+  geom_point(alpha = 0.4, color = "black") +
+  geom_smooth(method = "loess", span = smooth_span, color = "blue", se = TRUE) +
+  theme_minimal() +
+  labs(title = "CPI Inflation", x = "CPI Inflation", y = "Martingale Residual")
+
+plot_repo <- ggplot(df, aes(x = RBI_Repo_Rate, y = Mart_Res)) +
+  geom_point(alpha = 0.4, color = "black") +
+  geom_smooth(method = "loess", span = smooth_span, color = "blue", se = TRUE) +
+  theme_minimal() +
+  labs(title = "RBI Repo Rate", x = "RBI Repo Rate", y = "Martingale Residual")
+
+# 4. Arrange them into a single clean graphic
+grid.arrange(plot_gdp, plot_cpi, plot_repo, ncol = 1, top = "Smoothed Martingale Residuals of Null Cox Model")
+
+
+
+
+```
+
+```{r}
+#  Arrange them into a single clean graphic
+grid.arrange(plot_gdp, plot_cpi, plot_repo, ncol = 1, top = "Smoothed Martingale Residuals of Null Cox Model")
+```
+```{r}
+library(ggplot2)
+
+# Extract deviance residuals
+df$Dev_Res <- residuals(model_final, type = "deviance")
+
+# Plot without the confusing LOESS curve
+ggplot(df, aes(x = 1:nrow(df), y = Dev_Res)) +
+  geom_point(alpha = 0.5, color = "black") +
+  geom_hline(yintercept = 0, color = "green", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Deviance Residuals (Outlier Detection)", 
+       x = "Observation ID", 
+       y = "Deviance Residuals")
+```
+
+```{r}
+# KAPLAN-MEIER SURVIVAL CURVES BY SECTOR 
+library(survival)
+library(survminer)
+
+#Fit the Kaplan-Meier Model
+km_sector <- survfit(Surv(Duration, Event_Status) ~ Sector, data = df)
+
+#Plot the Curves
+print("--- PLOTTING KAPLAN-MEIER CURVES ---")
+ggsurvplot(km_sector, 
+           data = df,
+           pval = TRUE,              # Calculates and displays the Log-Rank p-value
+           conf.int = FALSE,         # Set to FALSE to keep the plot clean (5 confidence intervals gets messy)
+           risk.table = TRUE,        # Adds a professional risk table at the bottom
+           title = "Kaplan-Meier Survival Estimates by Mega-Sector",
+           xlab = "Survival Duration (Years)",
+           ylab = "Probability of Survival",
+           legend.title = "Mega-Sector",
+           ggtheme = theme_minimal())
+```
+
+```{r}
+
+```
+
